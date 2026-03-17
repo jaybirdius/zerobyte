@@ -1,6 +1,7 @@
 import { NotFoundError, BadRequestError, ConflictError } from "http-errors-enhanced";
 import type { BackupSchedule, Volume, Repository } from "../../db/schema";
 import { restic } from "../../core/restic";
+import { resticDeps } from "../../core/restic";
 import { logger } from "@zerobyte/core/node";
 import { cache, cacheKeys } from "../../utils/cache";
 import { getVolumePath } from "../volumes/helpers";
@@ -14,8 +15,34 @@ import { scheduleQueries, mirrorQueries, repositoryQueries } from "./backups.que
 import { calculateNextRun, createBackupOptions } from "./backup.helpers";
 import type { ResticBackupOutputDto } from "@zerobyte/core/restic";
 import type { BackupProgressEventDto } from "~/schemas/events-dto";
+import { decryptRepositoryConfig } from "../repositories/repository-config-secrets";
+import { agentManager } from "../agents/agents-manager";
+import type {
+	BackupCancelledPayload,
+	BackupCompletedPayload,
+	BackupFailedPayload,
+	BackupProgressPayload,
+	BackupRunPayload,
+	BackupStartedPayload,
+} from "@zerobyte/contracts/agent-protocol";
 
-const runningBackups = new Map<number, AbortController>();
+const LOCAL_AGENT_ID = "local";
+
+type RunningBackup = {
+	jobId: string;
+	context: BackupContext;
+	resolve: () => void;
+	reject: (error: unknown) => void;
+};
+
+type AgentBackupEvent<TPayload> = {
+	agentId: string;
+	agentName: string;
+	payload: TPayload;
+};
+
+const runningBackups = new Map<number, RunningBackup>();
+const runningBackupsByJobId = new Map<string, number>();
 
 export const getBackupProgress = (scheduleId: number): BackupProgressEventDto | undefined =>
 	cache.get<BackupProgressEventDto>(cacheKeys.backup.progress(scheduleId));
@@ -110,35 +137,72 @@ const emitBackupStarted = (ctx: BackupContext, scheduleId: number) => {
 		});
 };
 
-const runBackupOperation = async (ctx: BackupContext, signal: AbortSignal) => {
-	const volumePath = getVolumePath(ctx.volume);
-	const backupOptions = createBackupOptions(ctx.schedule, volumePath, signal);
+const buildAgentBackupPayload = async (ctx: BackupContext, jobId: string): Promise<BackupRunPayload> => {
+	const sourcePath = getVolumePath(ctx.volume);
+	const { signal: _ignoredSignal, ...options } = createBackupOptions(
+		ctx.schedule,
+		sourcePath,
+		new AbortController().signal,
+	);
+	const repositoryConfig = await decryptRepositoryConfig(ctx.repository.config);
+	const encryptedResticPassword = await resticDeps.getOrganizationResticPassword(ctx.organizationId);
+	const resticPassword = await resticDeps.resolveSecret(encryptedResticPassword);
 
-	const releaseBackupLock = await repoMutex.acquireShared(ctx.repository.id, `backup:${ctx.volume.name}`, signal);
-
-	try {
-		const result = await restic.backup(ctx.repository.config, volumePath, {
-			...backupOptions,
+	return {
+		jobId,
+		scheduleId: ctx.schedule.shortId,
+		organizationId: ctx.organizationId,
+		sourcePath,
+		repositoryConfig,
+		options: {
+			...options,
 			compressionMode: ctx.repository.compressionMode ?? "auto",
-			organizationId: ctx.organizationId,
-			onProgress: (progress) => {
-				const progressEvent = {
-					scheduleId: ctx.schedule.shortId,
-					volumeName: ctx.volume.name,
-					repositoryName: ctx.repository.name,
-					...progress,
-				};
-				cache.set(cacheKeys.backup.progress(ctx.schedule.id), progressEvent, 60 * 60);
-				serverEvents.emit("backup:progress", {
-					organizationId: ctx.organizationId,
-					...progressEvent,
-				});
-			},
-		});
-		return result;
-	} finally {
-		releaseBackupLock();
+		},
+		runtime: {
+			password: resticPassword,
+			cacheDir: resticDeps.resticCacheDir,
+			passFile: resticDeps.resticPassFile,
+			defaultExcludes: resticDeps.defaultExcludes,
+			hostname: resticDeps.hostname,
+		},
+	};
+};
+
+const getRunningBackupByJobId = (jobId: string) => {
+	const scheduleId = runningBackupsByJobId.get(jobId);
+	if (scheduleId === undefined) {
+		return null;
 	}
+
+	const running = runningBackups.get(scheduleId);
+	if (!running || running.jobId !== jobId) {
+		runningBackupsByJobId.delete(jobId);
+		return null;
+	}
+
+	return { scheduleId, running };
+};
+
+const clearRunningBackup = (scheduleId: number, jobId: string) => {
+	runningBackups.delete(scheduleId);
+	runningBackupsByJobId.delete(jobId);
+	cache.del(cacheKeys.backup.progress(scheduleId));
+};
+
+const updateBackupProgress = (ctx: BackupContext, progress: BackupProgressPayload["progress"]) => {
+	const progressEvent = {
+		scheduleId: ctx.schedule.shortId,
+		volumeName: ctx.volume.name,
+		repositoryName: ctx.repository.name,
+		...progress,
+	};
+
+	cache.set(cacheKeys.backup.progress(ctx.schedule.id), progressEvent, 60 * 60);
+
+	serverEvents.emit("backup:progress", {
+		organizationId: ctx.organizationId,
+		...progressEvent,
+	});
 };
 
 const finalizeSuccessfulBackup = async (
@@ -151,12 +215,12 @@ const finalizeSuccessfulBackup = async (
 	const finalStatus = exitCode === 0 ? "success" : "warning";
 
 	if (ctx.schedule.retentionPolicy) {
-		void runForget(scheduleId).catch((error) => {
+		void runForget(scheduleId, undefined, ctx.organizationId).catch((error) => {
 			logger.error(`Failed to run retention policy for schedule ${scheduleId}: ${toMessage(error)}`);
 		});
 	}
 
-	void copyToMirrors(scheduleId, ctx.repository, ctx.schedule.retentionPolicy).catch((error) => {
+	void copyToMirrors(scheduleId, ctx.repository, ctx.schedule.retentionPolicy, ctx.organizationId).catch((error) => {
 		logger.error(`Background mirror copy failed for schedule ${scheduleId}: ${toMessage(error)}`);
 	});
 
@@ -261,6 +325,148 @@ const handleBackupFailure = async (
 	}
 };
 
+const handleAgentBackupStarted = ({ payload, agentId }: AgentBackupEvent<BackupStartedPayload>) => {
+	const running = getRunningBackupByJobId(payload.jobId);
+	if (!running) {
+		logger.warn(`Received backup.started for unknown job ${payload.jobId} from agent ${agentId}`);
+		return;
+	}
+
+	if (running.running.context.schedule.shortId !== payload.scheduleId) {
+		logger.warn(
+			`Ignoring backup.started for job ${payload.jobId} due to schedule mismatch ${payload.scheduleId} from agent ${agentId}`,
+		);
+	}
+};
+
+const handleAgentBackupProgress = ({ payload, agentId }: AgentBackupEvent<BackupProgressPayload>) => {
+	const running = getRunningBackupByJobId(payload.jobId);
+	if (!running) {
+		logger.warn(`Received backup.progress for unknown job ${payload.jobId} from agent ${agentId}`);
+		return;
+	}
+
+	if (running.running.context.schedule.shortId !== payload.scheduleId) {
+		logger.warn(
+			`Ignoring backup.progress for job ${payload.jobId} due to schedule mismatch ${payload.scheduleId} from agent ${agentId}`,
+		);
+		return;
+	}
+
+	updateBackupProgress(running.running.context, payload.progress);
+};
+
+const handleAgentBackupCompleted = async ({ payload, agentId }: AgentBackupEvent<BackupCompletedPayload>) => {
+	const running = getRunningBackupByJobId(payload.jobId);
+	if (!running) {
+		logger.warn(`Received backup.completed for unknown job ${payload.jobId} from agent ${agentId}`);
+		return;
+	}
+
+	if (running.running.context.schedule.shortId !== payload.scheduleId) {
+		logger.warn(
+			`Ignoring backup.completed for job ${payload.jobId} due to schedule mismatch ${payload.scheduleId} from agent ${agentId}`,
+		);
+		return;
+	}
+
+	try {
+		await finalizeSuccessfulBackup(
+			running.running.context,
+			running.scheduleId,
+			payload.exitCode,
+			payload.result,
+			payload.warningDetails ?? null,
+		);
+		running.running.resolve();
+	} catch (error) {
+		await handleBackupFailure(
+			running.scheduleId,
+			running.running.context.organizationId,
+			error,
+			running.running.context,
+		);
+		running.running.reject(error);
+	} finally {
+		clearRunningBackup(running.scheduleId, payload.jobId);
+	}
+};
+
+const handleAgentBackupFailed = async ({ payload, agentId }: AgentBackupEvent<BackupFailedPayload>) => {
+	const running = getRunningBackupByJobId(payload.jobId);
+	if (!running) {
+		logger.warn(`Received backup.failed for unknown job ${payload.jobId} from agent ${agentId}`);
+		return;
+	}
+
+	if (running.running.context.schedule.shortId !== payload.scheduleId) {
+		logger.warn(
+			`Ignoring backup.failed for job ${payload.jobId} due to schedule mismatch ${payload.scheduleId} from agent ${agentId}`,
+		);
+		return;
+	}
+
+	try {
+		await handleBackupFailure(
+			running.scheduleId,
+			running.running.context.organizationId,
+			payload.errorDetails ?? payload.error,
+			running.running.context,
+		);
+		running.running.reject(new Error(payload.errorDetails ?? payload.error));
+	} finally {
+		clearRunningBackup(running.scheduleId, payload.jobId);
+	}
+};
+
+const handleAgentBackupCancelled = async ({ payload, agentId }: AgentBackupEvent<BackupCancelledPayload>) => {
+	const running = getRunningBackupByJobId(payload.jobId);
+	if (!running) {
+		logger.warn(`Received backup.cancelled for unknown job ${payload.jobId} from agent ${agentId}`);
+		return;
+	}
+
+	if (running.running.context.schedule.shortId !== payload.scheduleId) {
+		logger.warn(
+			`Ignoring backup.cancelled for job ${payload.jobId} due to schedule mismatch ${payload.scheduleId} from agent ${agentId}`,
+		);
+		return;
+	}
+
+	try {
+		await scheduleQueries.updateStatus(running.scheduleId, running.running.context.organizationId, {
+			lastBackupAt: Date.now(),
+			lastBackupStatus: "warning",
+			lastBackupError: payload.message ?? "Backup was stopped by the user",
+		});
+		running.running.resolve();
+	} catch (error) {
+		running.running.reject(error);
+	} finally {
+		clearRunningBackup(running.scheduleId, payload.jobId);
+	}
+};
+
+agentManager.setBackupEventHandlers({
+	onBackupStarted: (event) => handleAgentBackupStarted(event),
+	onBackupProgress: (event) => handleAgentBackupProgress(event),
+	onBackupCompleted: (event) => {
+		void handleAgentBackupCompleted(event).catch((error) => {
+			logger.error(`Failed to handle backup.completed event: ${toMessage(error)}`);
+		});
+	},
+	onBackupFailed: (event) => {
+		void handleAgentBackupFailed(event).catch((error) => {
+			logger.error(`Failed to handle backup.failed event: ${toMessage(error)}`);
+		});
+	},
+	onBackupCancelled: (event) => {
+		void handleAgentBackupCancelled(event).catch((error) => {
+			logger.error(`Failed to handle backup.cancelled event: ${toMessage(error)}`);
+		});
+	},
+});
+
 const executeBackup = async (scheduleId: number, manual = false): Promise<void> => {
 	const result = await validateBackupExecution(scheduleId, manual);
 
@@ -280,23 +486,33 @@ const executeBackup = async (scheduleId: number, manual = false): Promise<void> 
 		nextBackupAt,
 	});
 
-	const abortController = new AbortController();
-	runningBackups.set(scheduleId, abortController);
+	const jobId = Bun.randomUUIDv7();
+	const completion = new Promise<void>((resolve, reject) => {
+		runningBackups.set(scheduleId, {
+			jobId,
+			context: ctx,
+			resolve,
+			reject,
+		});
+		runningBackupsByJobId.set(jobId, scheduleId);
+	});
 
 	try {
-		const backupResult = await runBackupOperation(ctx, abortController.signal);
-		await finalizeSuccessfulBackup(
-			ctx,
-			scheduleId,
-			backupResult.exitCode,
-			backupResult.result,
-			backupResult.warningDetails,
-		);
+		const payload = await buildAgentBackupPayload(ctx, jobId);
+		const dispatched = agentManager.sendBackup(LOCAL_AGENT_ID, payload);
+
+		if (!dispatched) {
+			clearRunningBackup(scheduleId, jobId);
+			await handleBackupFailure(scheduleId, ctx.organizationId, new Error("Local backup agent is not connected"), ctx);
+			return;
+		}
+
+		await completion;
 	} catch (error) {
-		await handleBackupFailure(scheduleId, ctx.organizationId, error, ctx);
-	} finally {
-		runningBackups.delete(scheduleId);
-		cache.del(cacheKeys.backup.progress(scheduleId));
+		if (runningBackups.get(scheduleId)?.jobId === jobId) {
+			clearRunningBackup(scheduleId, jobId);
+			await handleBackupFailure(scheduleId, ctx.organizationId, error, ctx);
+		}
 	}
 };
 
@@ -314,13 +530,16 @@ const stopBackup = async (scheduleId: number) => {
 	}
 
 	try {
-		const abortController = runningBackups.get(scheduleId);
-		if (!abortController) {
+		const runningBackup = runningBackups.get(scheduleId);
+		if (!runningBackup) {
 			throw new ConflictError("No backup is currently running for this schedule");
 		}
 
 		logger.info(`Stopping backup for schedule ${scheduleId}`);
-		abortController.abort();
+		agentManager.cancelBackup(LOCAL_AGENT_ID, {
+			jobId: runningBackup.jobId,
+			scheduleId: runningBackup.context.schedule.shortId,
+		});
 	} finally {
 		await scheduleQueries.updateStatus(scheduleId, organizationId, {
 			lastBackupStatus: "warning",
@@ -329,8 +548,8 @@ const stopBackup = async (scheduleId: number) => {
 	}
 };
 
-const runForget = async (scheduleId: number, repositoryId?: string) => {
-	const organizationId = getOrganizationId();
+const runForget = async (scheduleId: number, repositoryId?: string, organizationIdOverride?: string) => {
+	const organizationId = organizationIdOverride ?? getOrganizationId();
 	const schedule = await scheduleQueries.findById(scheduleId, organizationId);
 
 	if (!schedule) {
@@ -364,8 +583,9 @@ const copyToMirrors = async (
 	scheduleId: number,
 	sourceRepository: Repository,
 	retentionPolicy: BackupSchedule["retentionPolicy"],
+	organizationIdOverride?: string,
 ) => {
-	const organizationId = getOrganizationId();
+	const organizationId = organizationIdOverride ?? getOrganizationId();
 	const schedule = await scheduleQueries.findById(scheduleId, organizationId);
 
 	if (!schedule) {
@@ -423,7 +643,7 @@ const copyToSingleMirror = async (
 		}
 
 		if (retentionPolicy) {
-			void runForget(scheduleId, mirror.repository.id).catch((error) => {
+			void runForget(scheduleId, mirror.repository.id, organizationId).catch((error) => {
 				logger.error(
 					`Failed to run retention policy for mirror repository ${mirror.repository.name}: ${toMessage(error)}`,
 				);
