@@ -15,7 +15,8 @@ const backupExecutionOptionsSchema = z
 		oneFileSystem: z.boolean().optional(),
 		exclude: z.array(z.string()).optional(),
 		excludeIfPresent: z.array(z.string()).optional(),
-		include: z.array(z.string()).optional(),
+		includePaths: z.array(z.string()).optional(),
+		includePatterns: z.array(z.string()).optional(),
 		customResticParams: z.array(z.string()).optional(),
 		compressionMode: compressionModeSchema.optional(),
 	})
