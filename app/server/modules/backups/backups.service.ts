@@ -1,25 +1,31 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { CronExpressionParser } from "cron-parser";
 import { NotFoundError, BadRequestError, ConflictError } from "http-errors-enhanced";
-
-const isValidCron = (expression: string): boolean => {
-	try {
-		CronExpressionParser.parse(expression);
-		return true;
-	} catch {
-		return false;
-	}
-};
-import { db } from "../../db/db";
-import { backupScheduleMirrorsTable, backupScheduleNotificationsTable, backupSchedulesTable } from "../../db/schema";
-import type { CreateBackupScheduleBody, UpdateBackupScheduleBody, UpdateScheduleMirrorsBody } from "./backups.dto";
-
+import { logger } from "@zerobyte/core/node";
 import { checkMirrorCompatibility, getIncompatibleMirrorError } from "~/server/utils/backend-compatibility";
 import { generateShortId } from "~/server/utils/id";
 import { getOrganizationId } from "~/server/core/request-context";
-import { calculateNextRun } from "./backup.helpers";
 import { asShortId, type ShortId } from "~/server/utils/branded";
 import { validateCustomResticParams } from "@zerobyte/core/restic/server";
+import { db } from "../../db/db";
+import { backupScheduleMirrorsTable, backupScheduleNotificationsTable, backupSchedulesTable } from "../../db/schema";
+import { cache, cacheKeys } from "../../utils/cache";
+import { repoMutex } from "../../core/repository-mutex";
+import { backupExecutor } from "./backup-executor";
+import { calculateNextRun, isValidCron } from "./backup.helpers";
+import { scheduleQueries } from "./backups.queries";
+import type { CreateBackupScheduleBody, UpdateBackupScheduleBody, UpdateScheduleMirrorsBody } from "./backups.dto";
+import {
+	emitBackupStarted,
+	finalizeSuccessfulBackup,
+	getBackupProgress,
+	handleBackupCancellation,
+	handleBackupFailure,
+	handleValidationResult,
+	updateBackupProgress,
+	validateBackupExecution,
+} from "./helpers/backup-lifecycle";
+import { getScheduleByIdOrShortId } from "./helpers/backup-schedule-lookups";
+import { copyToMirrors, runForget } from "./helpers/backup-maintenance";
 
 const listSchedules = async () => {
 	const organizationId = getOrganizationId();
@@ -32,62 +38,11 @@ const listSchedules = async () => {
 };
 
 const getScheduleById = async (scheduleId: number) => {
-	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: { AND: [{ id: scheduleId }, { organizationId }] },
-		with: { volume: true, repository: true },
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
-
-	if (!schedule.volume || !schedule.repository) {
-		throw new NotFoundError("Backup schedule not found");
-	}
-
-	return schedule;
+	return getScheduleByIdOrShortId(scheduleId);
 };
 
 const getScheduleByShortId = async (shortId: ShortId) => {
-	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: { AND: [{ shortId: { eq: shortId } }, { organizationId }] },
-		with: { volume: true, repository: true },
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
-
-	if (!schedule.volume || !schedule.repository) {
-		throw new NotFoundError("Backup schedule not found");
-	}
-
-	return schedule;
-};
-
-const getScheduleByIdOrShortId = async (idOrShortId: string | number) => {
-	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: {
-			AND: [
-				{ OR: [{ id: Number(idOrShortId) }, { shortId: { eq: asShortId(String(idOrShortId)) } }] },
-				{ organizationId },
-			],
-		},
-		with: { volume: true, repository: true },
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
-
-	if (!schedule.volume || !schedule.repository) {
-		throw new NotFoundError("Backup schedule not found");
-	}
-
-	return schedule;
+	return getScheduleByIdOrShortId(shortId);
 };
 
 const createSchedule = async (data: CreateBackupScheduleBody) => {
@@ -166,18 +121,7 @@ const createSchedule = async (data: CreateBackupScheduleBody) => {
 
 const updateSchedule = async (scheduleIdOrShortId: number | string, data: UpdateBackupScheduleBody) => {
 	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: {
-			AND: [
-				{ OR: [{ id: Number(scheduleIdOrShortId) }, { shortId: { eq: asShortId(String(scheduleIdOrShortId)) } }] },
-				{ organizationId },
-			],
-		},
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
+	const schedule = await getScheduleByIdOrShortId(scheduleIdOrShortId);
 
 	if (data.cronExpression && !isValidCron(data.cronExpression)) {
 		throw new BadRequestError("Invalid cron expression");
@@ -228,18 +172,7 @@ const updateSchedule = async (scheduleIdOrShortId: number | string, data: Update
 
 const deleteSchedule = async (scheduleIdOrShortId: number | string) => {
 	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: {
-			AND: [
-				{ OR: [{ id: Number(scheduleIdOrShortId) }, { shortId: { eq: asShortId(String(scheduleIdOrShortId)) } }] },
-				{ organizationId },
-			],
-		},
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
+	const schedule = await getScheduleByIdOrShortId(scheduleIdOrShortId);
 
 	await db
 		.delete(backupSchedulesTable)
@@ -277,19 +210,7 @@ const getScheduleForVolume = async (volumeIdOrShortId: number | string) => {
 };
 
 const getMirrors = async (scheduleIdOrShortId: number | string) => {
-	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: {
-			AND: [
-				{ OR: [{ id: Number(scheduleIdOrShortId) }, { shortId: { eq: asShortId(String(scheduleIdOrShortId)) } }] },
-				{ organizationId },
-			],
-		},
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
+	const schedule = await getScheduleByIdOrShortId(scheduleIdOrShortId);
 
 	const mirrors = await db.query.backupScheduleMirrorsTable.findMany({
 		where: {
@@ -313,19 +234,7 @@ const getMirrors = async (scheduleIdOrShortId: number | string) => {
 
 const updateMirrors = async (scheduleIdOrShortId: number | string, data: UpdateScheduleMirrorsBody) => {
 	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: {
-			AND: [
-				{ OR: [{ id: Number(scheduleIdOrShortId) }, { shortId: { eq: asShortId(String(scheduleIdOrShortId)) } }] },
-				{ organizationId },
-			],
-		},
-		with: { repository: true },
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
+	const schedule = await getScheduleByIdOrShortId(scheduleIdOrShortId);
 
 	const normalizedMirrors = await Promise.all(
 		data.mirrors.map(async (mirror) => {
@@ -392,19 +301,7 @@ const updateMirrors = async (scheduleIdOrShortId: number | string, data: UpdateS
 
 const getMirrorCompatibility = async (scheduleIdOrShortId: number | string) => {
 	const organizationId = getOrganizationId();
-	const schedule = await db.query.backupSchedulesTable.findFirst({
-		where: {
-			AND: [
-				{ OR: [{ id: Number(scheduleIdOrShortId) }, { shortId: { eq: asShortId(String(scheduleIdOrShortId)) } }] },
-				{ organizationId },
-			],
-		},
-		with: { repository: true },
-	});
-
-	if (!schedule) {
-		throw new NotFoundError("Backup schedule not found");
-	}
+	const schedule = await getScheduleByIdOrShortId(scheduleIdOrShortId);
 
 	const allRepositories = await db.query.repositoriesTable.findMany({ where: { organizationId } });
 	const repos = allRepositories.filter((repo) => repo.id !== schedule.repositoryId);
@@ -478,10 +375,90 @@ const cleanupOrphanedSchedules = async () => {
 
 	return { deletedSchedules: orphanScheduleIds.length };
 };
+const executeBackup = async (scheduleId: number, manual = false) => {
+	const result = await validateBackupExecution(scheduleId, manual);
+
+	if (result.type !== "success") {
+		return handleValidationResult(scheduleId, result);
+	}
+
+	const { context: ctx } = result;
+	cache.del(cacheKeys.backup.progress(scheduleId));
+	emitBackupStarted(ctx, scheduleId);
+
+	const nextBackupAt = calculateNextRun(ctx.schedule.cronExpression);
+
+	await scheduleQueries.updateStatus(scheduleId, ctx.organizationId, {
+		lastBackupStatus: "in_progress",
+		lastBackupError: null,
+		nextBackupAt,
+	});
+
+	const releaseLock = await repoMutex.acquireShared(ctx.repository.id, `backup:${ctx.volume.name}`);
+
+	try {
+		const executionResult = await backupExecutor.execute({
+			scheduleId,
+			schedule: ctx.schedule,
+			volume: ctx.volume,
+			repository: ctx.repository,
+			organizationId: ctx.organizationId,
+			onProgress: (progress) => {
+				updateBackupProgress(ctx, progress);
+			},
+		});
+
+		switch (executionResult.status) {
+			case "unavailable":
+				return handleBackupFailure(scheduleId, ctx.organizationId, executionResult.error, ctx);
+			case "completed":
+				return finalizeSuccessfulBackup(
+					ctx,
+					executionResult.exitCode,
+					executionResult.result,
+					executionResult.warningDetails,
+				);
+			case "failed":
+				return handleBackupFailure(scheduleId, ctx.organizationId, executionResult.error, ctx);
+			case "cancelled":
+				return handleBackupCancellation(scheduleId, ctx.organizationId, executionResult.message);
+		}
+	} catch (error) {
+		return handleBackupFailure(scheduleId, ctx.organizationId, error, ctx);
+	} finally {
+		releaseLock();
+		cache.del(cacheKeys.backup.progress(scheduleId));
+	}
+};
+
+const getSchedulesToExecute = async () => {
+	const organizationId = getOrganizationId();
+	return scheduleQueries.findExecutable(organizationId);
+};
+
+const stopBackup = async (scheduleId: number) => {
+	const organizationId = getOrganizationId();
+	const schedule = await scheduleQueries.findById(scheduleId, organizationId);
+
+	if (!schedule) {
+		throw new NotFoundError("Backup schedule not found");
+	}
+
+	try {
+		if (!backupExecutor.cancel(scheduleId)) {
+			throw new ConflictError("No backup is currently running for this schedule");
+		}
+
+		logger.info(`Stopping backup for schedule ${scheduleId}`);
+	} finally {
+		await handleBackupCancellation(scheduleId, organizationId);
+	}
+};
 
 export const backupsService = {
 	listSchedules,
 	getScheduleById,
+	getScheduleByShortId,
 	getScheduleByIdOrShortId,
 	createSchedule,
 	updateSchedule,
@@ -491,6 +468,12 @@ export const backupsService = {
 	updateMirrors,
 	getMirrorCompatibility,
 	reorderSchedules,
-	getScheduleByShortId,
 	cleanupOrphanedSchedules,
+	getBackupProgress,
+	validateBackupExecution,
+	executeBackup,
+	getSchedulesToExecute,
+	stopBackup,
+	runForget,
+	copyToMirrors,
 };
