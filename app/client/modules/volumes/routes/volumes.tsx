@@ -1,5 +1,5 @@
 import { useSuspenseQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, FolderOpen, HardDrive, Plus, RotateCcw, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Container, FolderOpen, HardDrive, Plus, RotateCcw, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { EmptyState } from "~/client/components/empty-state";
 import { StatusDot } from "~/client/components/status-dot";
@@ -34,7 +34,7 @@ export function VolumesPage() {
 	const [searchQuery, setSearchQuery] = useState("");
 	const [statusFilter, setStatusFilter] = useState("");
 	const [backendFilter, setBackendFilter] = useState("");
-	const [collapsedGroups, setCollapsedGroups] = useState<Set<number | "ungrouped">>(new Set());
+	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 	const [newGroupName, setNewGroupName] = useState("");
 	const [showGroupInput, setShowGroupInput] = useState(false);
 
@@ -118,7 +118,7 @@ export function VolumesPage() {
 		groupedVolumes.get(key)!.push(volume);
 	}
 
-	const toggleGroup = (id: number | "ungrouped") => {
+	const toggleGroup = (id: string) => {
 		setCollapsedGroups((prev) => {
 			const next = new Set(prev);
 			if (next.has(id)) next.delete(id);
@@ -147,14 +147,14 @@ export function VolumesPage() {
 		);
 	}
 
-	const renderVolumeRow = (volume: (typeof filteredVolumes)[0], indent = false) => (
+	const renderVolumeRow = (volume: (typeof filteredVolumes)[0], indent = false, deepIndent = false) => (
 		<TableRow
 			key={volume.shortId}
 			className="hover:bg-muted/50 hover:cursor-pointer transition-colors h-12"
 			onClick={() => navigate({ to: `/volumes/${volume.shortId}` })}
 		>
 			<TableCell className="font-medium font-mono text-strong-accent">
-				<div className={cn("flex items-center gap-2", indent && "pl-6")}>
+				<div className={cn("flex items-center gap-2", indent && !deepIndent && "pl-6", deepIndent && "pl-12")}>
 					<span>{volume.name}</span>
 				</div>
 			</TableCell>
@@ -196,13 +196,31 @@ export function VolumesPage() {
 	);
 
 	const renderGroupSection = (groupId: number, groupName: string, volumes: typeof filteredVolumes) => {
-		const isCollapsed = collapsedGroups.has(groupId);
+		const groupKey = `group-${groupId}`;
+		const isCollapsed = collapsedGroups.has(groupKey);
+
+		// Build subgroups by compose project
+		const subgroups = new Map<string, typeof filteredVolumes>();
+		const noSubgroup: typeof filteredVolumes = [];
+		for (const vol of volumes) {
+			const project = (vol as any).composeProject;
+			if (project) {
+				if (!subgroups.has(project)) subgroups.set(project, []);
+				subgroups.get(project)!.push(vol);
+			} else {
+				noSubgroup.push(vol);
+			}
+		}
+		const hasSubgroups = subgroups.size > 0;
+		// Sort subgroups alphabetically
+		const sortedSubgroups = [...subgroups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
 		return (
 			<>
 				<TableRow
-					key={`group-${groupId}`}
+					key={groupKey}
 					className="bg-muted/30 hover:bg-muted/50 cursor-pointer transition-colors"
-					onClick={() => toggleGroup(groupId)}
+					onClick={() => toggleGroup(groupKey)}
 				>
 					<TableCell colSpan={3}>
 						<div className="flex items-center gap-2 font-medium">
@@ -234,7 +252,36 @@ export function VolumesPage() {
 						</Button>
 					</TableCell>
 				</TableRow>
-				{!isCollapsed && volumes.map((v) => renderVolumeRow(v, true))}
+				{!isCollapsed && hasSubgroups && sortedSubgroups.map(([project, vols]) => {
+					const subKey = `sub-${groupId}-${project}`;
+					const isSubCollapsed = collapsedGroups.has(subKey);
+					return (
+						<>
+							<TableRow
+								key={subKey}
+								className="bg-muted/20 hover:bg-muted/40 cursor-pointer transition-colors"
+								onClick={() => toggleGroup(subKey)}
+							>
+								<TableCell colSpan={4}>
+									<div className="flex items-center gap-2 pl-6">
+										{isSubCollapsed ? (
+											<ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+										) : (
+											<ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+										)}
+										<Container className="h-3.5 w-3.5 text-blue-400" />
+										<span className="text-sm font-medium font-mono">{project}</span>
+										<span className="text-xs text-muted-foreground font-mono">
+											({vols.length})
+										</span>
+									</div>
+								</TableCell>
+							</TableRow>
+							{!isSubCollapsed && vols.map((v) => renderVolumeRow(v, true, true))}
+						</>
+					);
+				})}
+				{!isCollapsed && noSubgroup.map((v) => renderVolumeRow(v, true, false))}
 			</>
 		);
 	};

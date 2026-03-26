@@ -19,6 +19,7 @@ import { getOrganizationId } from "~/server/core/request-context";
 import { isNodeJSErrnoException } from "~/server/utils/fs";
 import { asShortId, type ShortId } from "~/server/utils/branded";
 import { encryptVolumeConfig } from "./volume-config-secrets";
+import { listDockerVolumes } from "../backends/docker/docker-service";
 
 const listVolumes = async () => {
 	const organizationId = getOrganizationId();
@@ -27,7 +28,32 @@ const listVolumes = async () => {
 		orderBy: { id: "asc" },
 	});
 
-	return volumes;
+	// Enrich Docker volumes with compose project from Docker labels
+	let dockerVolumeLabels: Map<string, string> | undefined;
+	const hasDockerVolumes = volumes.some((v) => v.config.backend === "docker");
+
+	if (hasDockerVolumes) {
+		try {
+			const dockerVolumes = await listDockerVolumes();
+			dockerVolumeLabels = new Map();
+			for (const dv of dockerVolumes) {
+				const project = dv.labels["com.docker.compose.project"];
+				if (project) {
+					dockerVolumeLabels.set(dv.name, project);
+				}
+			}
+		} catch {
+			// Docker socket may not be available
+		}
+	}
+
+	return volumes.map((v) => {
+		const composeProject =
+			v.config.backend === "docker" && dockerVolumeLabels
+				? dockerVolumeLabels.get(v.config.volumeName) ?? null
+				: null;
+		return { ...v, composeProject };
+	});
 };
 
 const findVolume = async (shortId: ShortId) => {

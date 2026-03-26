@@ -16,6 +16,7 @@ export const volumeSchema = z.object({
 	config: volumeConfigSchema,
 	autoRemount: z.boolean(),
 	groupId: z.number().nullable().optional(),
+	composeProject: z.string().nullable().optional(),
 });
 
 export type VolumeDto = z.infer<typeof volumeSchema>;
