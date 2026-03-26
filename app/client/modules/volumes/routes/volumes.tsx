@@ -178,7 +178,7 @@ export function VolumesPage() {
 							})
 						}
 					>
-						<SelectTrigger className="w-32 h-8 text-xs">
+						<SelectTrigger className="w-44 h-8 text-xs">
 							<SelectValue placeholder="No group" />
 						</SelectTrigger>
 						<SelectContent>
@@ -338,7 +338,7 @@ export function VolumesPage() {
 							<TableHead className="w-25 uppercase">Name</TableHead>
 							<TableHead className="uppercase text-left">Backend</TableHead>
 							<TableHead className="uppercase text-center">Status</TableHead>
-							<TableHead className="uppercase text-right w-36">Group</TableHead>
+							<TableHead className="uppercase text-right w-48">Group</TableHead>
 						</TableRow>
 					</TableHeader>
 					<TableBody>
