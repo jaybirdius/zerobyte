@@ -19,6 +19,7 @@ import { Input } from "../../../components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../../components/ui/select";
 import {
 	directoryConfigSchema,
+	dockerConfigSchema,
 	nfsConfigSchema,
 	rcloneConfigSchema,
 	sftpConfigSchema,
@@ -30,10 +31,11 @@ import { testConnectionMutation } from "../../../api-client/@tanstack/react-quer
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../components/ui/tooltip";
 import { useSystemInfo } from "~/client/hooks/use-system-info";
 import { useScrollToFormError } from "~/client/hooks/use-scroll-to-form-error";
-import { DirectoryForm, NFSForm, SMBForm, WebDAVForm, RcloneForm, SFTPForm } from "./volume-forms";
+import { DirectoryForm, DockerForm, NFSForm, SMBForm, WebDAVForm, RcloneForm, SFTPForm } from "./volume-forms";
 
 export const formSchema = z.discriminatedUnion("backend", [
 	directoryConfigSchema.extend({ name: z.string().min(2).max(32) }),
+	dockerConfigSchema.extend({ name: z.string().min(2).max(64) }),
 	nfsConfigSchema.extend({ name: z.string().min(2).max(32) }),
 	smbConfigSchema.extend({ name: z.string().min(2).max(32) }),
 	webdavConfigSchema.extend({ name: z.string().min(2).max(32) }),
@@ -54,6 +56,7 @@ type Props = {
 
 const defaultValuesForType = {
 	directory: { backend: "directory" as const, path: "/" },
+	docker: { backend: "docker" as const, volumeName: "" },
 	nfs: { backend: "nfs" as const, port: 2049, version: "4.1" as const },
 	smb: { backend: "smb" as const, port: 445, vers: "3.0" as const },
 	webdav: { backend: "webdav" as const, port: 80, ssl: false, path: "/webdav" },
@@ -167,6 +170,7 @@ export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, for
 								</FormControl>
 								<SelectContent>
 									<SelectItem value="directory">Directory</SelectItem>
+									<SelectItem value="docker">Docker Volume</SelectItem>
 									<Tooltip>
 										<TooltipTrigger asChild>
 											<div>
@@ -238,6 +242,7 @@ export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, for
 					)}
 				/>
 				{watchedBackend === "directory" && <DirectoryForm form={form} />}
+				{watchedBackend === "docker" && <DockerForm form={form} />}
 				{watchedBackend === "nfs" && <NFSForm form={form} />}
 				{watchedBackend === "webdav" && <WebDAVForm form={form} />}
 				{watchedBackend === "smb" && <SMBForm form={form} />}

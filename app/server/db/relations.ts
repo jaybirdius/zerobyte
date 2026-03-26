@@ -103,6 +103,7 @@ export const relations = defineRelations(schema, (r) => ({
 		notificationDestinations: r.many.notificationDestinationsTable(),
 		repositories: r.many.repositoriesTable(),
 		volumes: r.many.volumesTable(),
+		volumeGroups: r.many.volumeGroupsTable(),
 		members: r.many.member(),
 		invitations: r.many.invitation(),
 		ssoProviders: r.many.ssoProvider(),
@@ -123,6 +124,18 @@ export const relations = defineRelations(schema, (r) => ({
 		backupSchedules: r.many.backupSchedulesTable(),
 		organization: r.one.organization({
 			from: r.volumesTable.organizationId,
+			to: r.organization.id,
+		}),
+		group: r.one.volumeGroupsTable({
+			from: r.volumesTable.groupId,
+			to: r.volumeGroupsTable.id,
+			optional: true,
+		}),
+	},
+	volumeGroupsTable: {
+		volumes: r.many.volumesTable(),
+		organization: r.one.organization({
+			from: r.volumeGroupsTable.organizationId,
 			to: r.organization.id,
 		}),
 	},

@@ -94,8 +94,12 @@ export function VolumesPage() {
 						</SelectTrigger>
 						<SelectContent>
 							<SelectItem value="directory">Directory</SelectItem>
+							<SelectItem value="docker">Docker</SelectItem>
 							<SelectItem value="nfs">NFS</SelectItem>
 							<SelectItem value="smb">SMB</SelectItem>
+							<SelectItem value="sftp">SFTP</SelectItem>
+							<SelectItem value="webdav">WebDAV</SelectItem>
+							<SelectItem value="rclone">Rclone</SelectItem>
 						</SelectContent>
 					</Select>
 					{(searchQuery || statusFilter || backendFilter) && (

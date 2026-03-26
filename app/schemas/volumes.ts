@@ -4,6 +4,7 @@ export const BACKEND_TYPES = {
 	nfs: "nfs",
 	smb: "smb",
 	directory: "directory",
+	docker: "docker",
 	webdav: "webdav",
 	rclone: "rclone",
 	sftp: "sftp",
@@ -86,11 +87,18 @@ export const sftpConfigSchema = z.object({
 	knownHosts: z.string().optional(),
 });
 
+export const dockerConfigSchema = z.object({
+	backend: z.literal("docker"),
+	volumeName: z.string().min(1),
+	readOnly: z.literal(false).optional(),
+});
+
 export const volumeConfigSchemaBase = z.discriminatedUnion("backend", [
 	nfsConfigSchema,
 	smbConfigSchema,
 	webdavConfigSchema,
 	directoryConfigSchema,
+	dockerConfigSchema,
 	rcloneConfigSchema,
 	sftpConfigSchema,
 ]);

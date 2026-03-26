@@ -7,6 +7,7 @@ import { makeRcloneBackend } from "./rclone/rclone-backend";
 import { makeSmbBackend } from "./smb/smb-backend";
 import { makeWebdavBackend } from "./webdav/webdav-backend";
 import { makeSftpBackend } from "./sftp/sftp-backend";
+import { makeDockerBackend } from "./docker/docker-backend";
 
 type OperationResult = {
 	error?: string;
@@ -40,6 +41,9 @@ export const createVolumeBackend = (volume: Volume): VolumeBackend => {
 		}
 		case "sftp": {
 			return makeSftpBackend(volume.config, path);
+		}
+		case "docker": {
+			return makeDockerBackend(volume.config, path);
 		}
 		default: {
 			throw new Error("Unsupported backend");

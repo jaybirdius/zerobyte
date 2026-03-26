@@ -1,4 +1,4 @@
-import { Cloud, Folder, Server } from "lucide-react";
+import { Cloud, Container, Folder, Server } from "lucide-react";
 import type { BackendType } from "~/schemas/volumes";
 
 type VolumeIconProps = {
@@ -26,6 +26,11 @@ const getIconAndLabel = (backend: BackendType) => {
 			return {
 				icon: Server,
 				label: "WebDAV",
+			};
+		case "docker":
+			return {
+				icon: Container,
+				label: "Docker",
 			};
 		case "rclone":
 			return {

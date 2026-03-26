@@ -27,6 +27,8 @@ import { volumeService } from "./volume.service";
 import { getVolumePath } from "./helpers";
 import { requireAuth } from "../auth/auth.middleware";
 import { asShortId } from "~/server/utils/branded";
+import { listDockerVolumes } from "../backends/docker/docker-service";
+import { volumeGroupService } from "./volume-group.service";
 
 export const volumeController = new Hono()
 	.use(requireAuth)
@@ -138,4 +140,41 @@ export const volumeController = new Hono()
 		};
 
 		return c.json<BrowseFilesystemDto>(response, 200);
+	})
+	// Docker volumes discovery
+	.get("/docker/list", async (c) => {
+		try {
+			const volumes = await listDockerVolumes();
+			return c.json({ volumes }, 200);
+		} catch (error) {
+			return c.json({ error: "Failed to list Docker volumes. Is the Docker socket mounted?" }, 500);
+		}
+	})
+	// Volume Groups CRUD
+	.get("/groups", async (c) => {
+		const groups = await volumeGroupService.listGroups();
+		return c.json(groups, 200);
+	})
+	.post("/groups", async (c) => {
+		const body = await c.req.json();
+		const group = await volumeGroupService.createGroup(body.name);
+		return c.json(group, 201);
+	})
+	.put("/groups/:id", async (c) => {
+		const id = Number(c.req.param("id"));
+		const body = await c.req.json();
+		const group = await volumeGroupService.updateGroup(id, body);
+		return c.json(group, 200);
+	})
+	.delete("/groups/:id", async (c) => {
+		const id = Number(c.req.param("id"));
+		await volumeGroupService.deleteGroup(id);
+		return c.json({ message: "Group deleted" }, 200);
+	})
+	// Assign volume to group
+	.put("/:shortId/group", async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const body = await c.req.json();
+		await volumeGroupService.assignVolumeToGroup(shortId, body.groupId);
+		return c.json({ ok: true }, 200);
 	});

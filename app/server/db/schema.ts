@@ -196,6 +196,27 @@ export const ssoProvider = sqliteTable("sso_provider", {
 });
 
 /**
+ * Volume Groups Table
+ */
+export const volumeGroupsTable = sqliteTable(
+	"volume_groups_table",
+	{
+		id: int().primaryKey({ autoIncrement: true }),
+		name: text().notNull(),
+		sortOrder: int("sort_order", { mode: "number" }).notNull().default(0),
+		createdAt: integer("created_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		organizationId: text("organization_id")
+			.notNull()
+			.references(() => organization.id, { onDelete: "cascade" }),
+	},
+	(table) => [unique().on(table.name, table.organizationId)],
+);
+export type VolumeGroup = typeof volumeGroupsTable.$inferSelect;
+export type VolumeGroupInsert = typeof volumeGroupsTable.$inferInsert;
+
+/**
  * Volumes Table
  */
 export const volumesTable = sqliteTable(
@@ -220,6 +241,7 @@ export const volumesTable = sqliteTable(
 			.default(sql`(unixepoch() * 1000)`),
 		config: text("config", { mode: "json" }).$type<BackendConfig>().notNull(),
 		autoRemount: int("auto_remount", { mode: "boolean" }).notNull().default(true),
+		groupId: int("group_id").references(() => volumeGroupsTable.id, { onDelete: "set null" }),
 		organizationId: text("organization_id")
 			.notNull()
 			.references(() => organization.id, { onDelete: "cascade" }),

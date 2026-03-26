@@ -137,6 +137,29 @@ const unmountVolume = async (shortId: ShortId) => {
 	return { error, status };
 };
 
+/**
+ * Calculate the actual disk usage of a directory (sum of all file sizes).
+ * Used for Docker volumes where statfs returns the whole disk's stats.
+ */
+const getDirectoryUsage = async (dirPath: string): Promise<number> => {
+	let total = 0;
+	try {
+		const entries = await fs.readdir(dirPath, { withFileTypes: true });
+		for (const entry of entries) {
+			const fullPath = path.join(dirPath, entry.name);
+			if (entry.isFile()) {
+				const stat = await fs.stat(fullPath);
+				total += stat.size;
+			} else if (entry.isDirectory()) {
+				total += await getDirectoryUsage(fullPath);
+			}
+		}
+	} catch {
+		// Ignore permission errors or missing paths
+	}
+	return total;
+};
+
 const getVolume = async (shortId: ShortId) => {
 	const volume = await findVolume(shortId);
 
@@ -146,10 +169,25 @@ const getVolume = async (shortId: ShortId) => {
 
 	let statfs: Partial<StatFs> = {};
 	if (volume.status === "mounted") {
-		statfs = await withTimeout(getStatFs(getVolumePath(volume)), 1000, "getStatFs").catch((error) => {
-			logger.warn(`Failed to get statfs for volume ${volume.name}: ${toMessage(error)}`);
-			return {};
-		});
+		const volumePath = getVolumePath(volume);
+
+		if (volume.config.backend === "docker") {
+			// For Docker volumes, get the actual volume data usage instead of disk stats
+			const [diskStats, volumeUsage] = await Promise.all([
+				withTimeout(getStatFs(volumePath), 1000, "getStatFs").catch(() => ({ total: 0, used: 0, free: 0 })),
+				withTimeout(getDirectoryUsage(volumePath), 5000, "getDirectoryUsage").catch(() => 0),
+			]);
+			statfs = {
+				total: diskStats.total, // Show total disk capacity
+				used: volumeUsage, // Show actual volume data size
+				free: diskStats.total - volumeUsage, // Remaining capacity
+			};
+		} else {
+			statfs = await withTimeout(getStatFs(volumePath), 1000, "getStatFs").catch((error) => {
+				logger.warn(`Failed to get statfs for volume ${volume.name}: ${toMessage(error)}`);
+				return {};
+			});
+		}
 	}
 
 	return { volume, statfs };
