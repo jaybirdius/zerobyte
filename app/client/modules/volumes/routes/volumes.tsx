@@ -170,11 +170,11 @@ export function VolumesPage() {
 			<TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
 				{hasGroups && (
 					<Select
-						value={String((volume as any).groupId ?? "")}
+						value={String((volume as any).groupId ?? "none")}
 						onValueChange={(val) =>
 							assignGroupMutation.mutate({
 								shortId: volume.shortId,
-								groupId: val ? Number(val) : null,
+								groupId: val === "none" ? null : Number(val),
 							})
 						}
 					>
@@ -182,7 +182,7 @@ export function VolumesPage() {
 							<SelectValue placeholder="No group" />
 						</SelectTrigger>
 						<SelectContent>
-							<SelectItem value="">No group</SelectItem>
+							<SelectItem value="none">No group</SelectItem>
 							{groups.map((g) => (
 								<SelectItem key={g.id} value={String(g.id)}>
 									{g.name}
