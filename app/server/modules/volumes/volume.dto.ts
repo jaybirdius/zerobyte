@@ -15,6 +15,7 @@ export const volumeSchema = z.object({
 	lastHealthCheck: z.number(),
 	config: volumeConfigSchema,
 	autoRemount: z.boolean(),
+	groupId: z.number().nullable().optional(),
 });
 
 export type VolumeDto = z.infer<typeof volumeSchema>;
